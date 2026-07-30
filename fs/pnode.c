@@ -105,6 +105,9 @@ static int do_make_slave(struct mount *mnt)
 		}
 		list_del_init(&mnt->mnt_share);
 		mnt->mnt_group_id = 0;
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+		mnt->susfs_mnt_group_id_owner = SUSFS_MNT_GROUP_ID_NORMAL;
+#endif
 		CLEAR_MNT_SHARED(mnt);
 	}
 	list_for_each_entry(slave_mnt, &mnt->mnt_slave_list, mnt_slave)

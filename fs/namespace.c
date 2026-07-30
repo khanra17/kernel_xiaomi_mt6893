@@ -26,6 +26,12 @@
 #include <linux/bootmem.h>
 #include <linux/task_work.h>
 #include <linux/sched/task.h>
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+#include <linux/susfs_def.h>
+extern bool susfs_is_current_ksu_domain(void);
+extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;
+#define CL_COPY_MNT_NS BIT(25)
+#endif
 
 #include "pnode.h"
 #include "internal.h"
@@ -64,6 +70,13 @@ static DEFINE_IDA(mnt_group_ida);
 static DEFINE_SPINLOCK(mnt_id_lock);
 static int mnt_id_start = 0;
 static int mnt_group_start = 1;
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+static DEFINE_IDA(susfs_mnt_id_ida);
+static DEFINE_IDA(susfs_mnt_group_ida);
+static DEFINE_SPINLOCK(susfs_mnt_id_lock);
+static int susfs_mnt_id_start = DEFAULT_KSU_MNT_ID;
+static int susfs_mnt_group_start = DEFAULT_KSU_MNT_GROUP_ID;
+#endif
 
 static struct hlist_head *mount_hashtable __read_mostly;
 static struct hlist_head *mountpoint_hashtable __read_mostly;
@@ -99,6 +112,26 @@ static inline struct hlist_head *mp_hash(struct dentry *dentry)
 	return &mountpoint_hashtable[tmp & mp_hash_mask];
 }
 
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+static int susfs_mnt_alloc_id(struct mount *mnt)
+{
+	int res;
+
+retry:
+	ida_pre_get(&susfs_mnt_id_ida, GFP_KERNEL);
+	spin_lock(&susfs_mnt_id_lock);
+	res = ida_get_new_above(&susfs_mnt_id_ida, susfs_mnt_id_start,
+				&mnt->mnt_id);
+	if (!res)
+		susfs_mnt_id_start = mnt->mnt_id + 1;
+	spin_unlock(&susfs_mnt_id_lock);
+	if (res == -EAGAIN)
+		goto retry;
+
+	return res;
+}
+#endif
+
 static int mnt_alloc_id(struct mount *mnt)
 {
 	int res;
@@ -119,6 +152,21 @@ retry:
 static void mnt_free_id(struct mount *mnt)
 {
 	int id = mnt->mnt_id;
+
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+	if (mnt->susfs_mnt_id_owner == SUSFS_MNT_ID_BORROWED)
+		return;
+
+	if (mnt->susfs_mnt_id_owner == SUSFS_MNT_ID_ALLOCATED) {
+		spin_lock(&susfs_mnt_id_lock);
+		ida_remove(&susfs_mnt_id_ida, id);
+		if (susfs_mnt_id_start > id)
+			susfs_mnt_id_start = id;
+		spin_unlock(&susfs_mnt_id_lock);
+		return;
+	}
+#endif
+
 	spin_lock(&mnt_id_lock);
 	ida_remove(&mnt_id_ida, id);
 	if (mnt_id_start > id)
@@ -134,6 +182,25 @@ static void mnt_free_id(struct mount *mnt)
 static int mnt_alloc_group_id(struct mount *mnt)
 {
 	int res;
+
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+	if (mnt->susfs_mnt_id_owner == SUSFS_MNT_ID_ALLOCATED ||
+	    (static_branch_unlikely(&susfs_is_sdcard_android_data_not_decrypted) &&
+	     susfs_is_current_ksu_domain())) {
+		if (!ida_pre_get(&susfs_mnt_group_ida, GFP_KERNEL))
+			return -ENOMEM;
+
+		res = ida_get_new_above(&susfs_mnt_group_ida,
+					susfs_mnt_group_start,
+					&mnt->mnt_group_id);
+		if (!res) {
+			susfs_mnt_group_start = mnt->mnt_group_id + 1;
+			mnt->susfs_mnt_group_id_owner =
+				SUSFS_MNT_GROUP_ID_ALLOCATED;
+		}
+		return res;
+	}
+#endif
 
 	if (!ida_pre_get(&mnt_group_ida, GFP_KERNEL))
 		return -ENOMEM;
@@ -153,6 +220,19 @@ static int mnt_alloc_group_id(struct mount *mnt)
 void mnt_release_group_id(struct mount *mnt)
 {
 	int id = mnt->mnt_group_id;
+
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+	if (mnt->susfs_mnt_group_id_owner ==
+	    SUSFS_MNT_GROUP_ID_ALLOCATED) {
+		ida_remove(&susfs_mnt_group_ida, id);
+		if (susfs_mnt_group_start > id)
+			susfs_mnt_group_start = id;
+		mnt->mnt_group_id = 0;
+		mnt->susfs_mnt_group_id_owner = SUSFS_MNT_GROUP_ID_NORMAL;
+		return;
+	}
+#endif
+
 	ida_remove(&mnt_group_ida, id);
 	if (mnt_group_start > id)
 		mnt_group_start = id;
@@ -200,15 +280,46 @@ static void drop_mountpoint(struct fs_pin *p)
 	mntput(&m->mnt);
 }
 
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+static struct mount *alloc_vfsmnt(const char *name,
+		enum susfs_mnt_id_owner id_owner, int borrowed_mnt_id)
+#else
 static struct mount *alloc_vfsmnt(const char *name)
+#endif
 {
 	struct mount *mnt = kmem_cache_zalloc(mnt_cache, GFP_KERNEL);
 	if (mnt) {
 		int err;
 
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+		switch (id_owner) {
+		case SUSFS_MNT_ID_ALLOCATED:
+			err = susfs_mnt_alloc_id(mnt);
+			break;
+		case SUSFS_MNT_ID_BORROWED:
+			mnt->mnt_id = borrowed_mnt_id;
+			err = 0;
+			break;
+		case SUSFS_MNT_ID_NORMAL:
+		default:
+			err = mnt_alloc_id(mnt);
+			id_owner = SUSFS_MNT_ID_NORMAL;
+			break;
+		}
+#else
 		err = mnt_alloc_id(mnt);
+#endif
 		if (err)
 			goto out_free_cache;
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+		mnt->susfs_mnt_id_owner = id_owner;
+		if (id_owner != SUSFS_MNT_ID_NORMAL) {
+			WARN_ON_ONCE(id_owner == SUSFS_MNT_ID_ALLOCATED &&
+				mnt->mnt_id < DEFAULT_KSU_MNT_ID);
+			WARN_ON_ONCE(id_owner == SUSFS_MNT_ID_BORROWED &&
+				mnt->mnt_id <= 0);
+		}
+#endif
 
 		if (name) {
 			mnt->mnt_devname = kstrdup_const(name, GFP_KERNEL);
@@ -1038,7 +1149,15 @@ vfs_kern_mount(struct file_system_type *type, int flags, const char *name, void 
 	if (!type)
 		return ERR_PTR(-ENODEV);
 
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+	if (static_branch_unlikely(&susfs_is_sdcard_android_data_not_decrypted) &&
+	    susfs_is_current_ksu_domain())
+		mnt = alloc_vfsmnt(name, SUSFS_MNT_ID_ALLOCATED, 0);
+	else
+		mnt = alloc_vfsmnt(name, SUSFS_MNT_ID_NORMAL, 0);
+#else
 	mnt = alloc_vfsmnt(name);
+#endif
 	if (!mnt)
 		return ERR_PTR(-ENOMEM);
 
@@ -1092,8 +1211,23 @@ static struct mount *clone_mnt(struct mount *old, struct dentry *root,
 	struct super_block *sb = old->mnt.mnt_sb;
 	struct mount *mnt;
 	int err;
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+	enum susfs_mnt_id_owner id_owner = SUSFS_MNT_ID_NORMAL;
 
+	if (static_branch_unlikely(&susfs_is_sdcard_android_data_not_decrypted) &&
+	    susfs_is_current_ksu_domain()) {
+		if (flag & CL_COPY_MNT_NS)
+			id_owner = SUSFS_MNT_ID_BORROWED;
+		else
+			id_owner = SUSFS_MNT_ID_ALLOCATED;
+	} else if (old->mnt_id >= DEFAULT_KSU_MNT_ID) {
+		id_owner = SUSFS_MNT_ID_ALLOCATED;
+	}
+
+	mnt = alloc_vfsmnt(old->mnt_devname, id_owner, old->mnt_id);
+#else
 	mnt = alloc_vfsmnt(old->mnt_devname);
+#endif
 	if (!mnt)
 		return ERR_PTR(-ENOMEM);
 
@@ -1105,10 +1239,17 @@ static struct mount *clone_mnt(struct mount *old, struct dentry *root,
 		}
 	}
 
-	if (flag & (CL_SLAVE | CL_PRIVATE | CL_SHARED_TO_SLAVE))
+	if (flag & (CL_SLAVE | CL_PRIVATE | CL_SHARED_TO_SLAVE)) {
 		mnt->mnt_group_id = 0; /* not a peer of original */
-	else
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+		mnt->susfs_mnt_group_id_owner = SUSFS_MNT_GROUP_ID_NORMAL;
+#endif
+	} else {
 		mnt->mnt_group_id = old->mnt_group_id;
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+		mnt->susfs_mnt_group_id_owner = old->susfs_mnt_group_id_owner;
+#endif
+	}
 
 	if ((flag & CL_MAKE_SHARED) && !mnt->mnt_group_id) {
 		err = mnt_alloc_group_id(mnt);
@@ -3024,6 +3165,9 @@ struct mnt_namespace *copy_mnt_ns(unsigned long flags, struct mnt_namespace *ns,
 	copy_flags = CL_COPY_UNBINDABLE | CL_EXPIRE;
 	if (user_ns != ns->user_ns)
 		copy_flags |= CL_SHARED_TO_SLAVE | CL_UNPRIVILEGED;
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+	copy_flags |= CL_COPY_MNT_NS;
+#endif
 	new = copy_tree(old, old->mnt.mnt_root, copy_flags);
 	if (IS_ERR(new)) {
 		namespace_unlock();
@@ -3600,3 +3744,34 @@ const struct proc_ns_operations mntns_operations = {
 	.install	= mntns_install,
 	.owner		= mntns_owner,
 };
+
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+/* - To retrieve the non sus mnt_id from mount */
+int susfs_get_non_sus_mnt_id_from_mnt(struct mount *orig_mnt) {
+	struct mount *mnt = orig_mnt;
+	int mnt_id;
+
+	lock_mount_hash();
+	for (; mnt && mnt->mnt_parent && mnt != mnt->mnt_parent && mnt->mnt_id >= DEFAULT_KSU_MNT_ID; mnt = mnt->mnt_parent) { }
+	mnt_id = mnt->mnt_id;
+	unlock_mount_hash();
+	return mnt_id;
+}
+
+/* - To retrieve the non sus vfsmount from vfsmount, takes a reference on &mnt->mnt and mnt->mnt.mnt_root */
+struct vfsmount *susfs_get_non_sus_vfsmnt_from_vfsmnt(struct vfsmount *vfsmnt) {
+	struct mount *mnt = real_mount(vfsmnt);
+
+	lock_mount_hash();
+	for (; mnt && mnt->mnt_parent && mnt != mnt->mnt_parent && mnt->mnt_id >= DEFAULT_KSU_MNT_ID; mnt = mnt->mnt_parent) { }
+	mntget(&mnt->mnt);
+	if (!mnt->mnt.mnt_root || IS_ERR(mnt->mnt.mnt_root)) {
+		mntput(&mnt->mnt);
+		unlock_mount_hash();
+		return vfsmnt;
+	}
+	dget(mnt->mnt.mnt_root);
+	unlock_mount_hash();
+	return &mnt->mnt;
+}
+#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
