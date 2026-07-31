@@ -55,23 +55,29 @@ if ! make -j$(nproc --all) O=out ARCH=arm64 HOSTCC=clang CC="ccache clang" LLVM=
 fi
 
 echo -e "\nKernel compiled successfully! Zipping up...\n"
+AK3_REPO="https://github.com/osm0sis/AnyKernel3.git"
 rm -rf AnyKernel3
 for attempt in 1 2 3; do
-    git clone -q --depth=1 https://github.com/rio004/AnyKernel3 AnyKernel3 && break
+    git clone -q --depth=1 "$AK3_REPO" AnyKernel3 && break
     echo "AnyKernel3 clone attempt $attempt failed."
     rm -rf AnyKernel3
     sleep 2
 done
 if [ ! -d AnyKernel3 ]; then
-    echo "Packaging failed: unable to clone AnyKernel3."
+    echo "Packaging failed: unable to clone $AK3_REPO."
     exit 1
 fi
 
-if ! cp out/arch/arm64/boot/Image.gz AnyKernel3/Image.gz; then
-    echo "Packaging failed: unable to copy Image.gz."
+if ! cp packaging/anykernel.sh AnyKernel3/anykernel.sh ||
+   ! cp out/arch/arm64/boot/Image.gz AnyKernel3/Image.gz; then
+    echo "Packaging failed: unable to install ares files."
     rm -rf AnyKernel3
     exit 1
 fi
+
+# This package only replaces the boot kernel. These upstream tools are for
+# logical-partition, policy, FEC, and snapshot operations that are not used.
+rm -f AnyKernel3/tools/{fec,httools_static,lptools_static,magiskpolicy,snapshotupdater_static}
 rm -f "$ZIPNAME"
 if ! (cd AnyKernel3 && zip -r9 "../$ZIPNAME" * -x '*.git*' README.md '*placeholder*'); then
     echo "Packaging failed: zip command failed."
